@@ -21,6 +21,28 @@ names(metals) <- metal.codes
 MCLs <- c(10, 5, 60, 300, 4000)
 names(MCLs) <- metal.codes
 
+#### Back-transformed (real concentration unit) regression metrics ####
+# Predictions are back-transformed as 10^.pred (i.e. `antilog_pred`, the same quantity mapped in
+# 9_Map_Predict.R) and compared with observed concentrations in ug/L. Note that .pred estimates
+# E[log10 C], so 10^.pred estimates the conditional MEDIAN rather than the conditional mean;
+# me_ugL reports the resulting bias. Pooling matches calc_reg_metrics(): an unweighted mean of the
+# per-imputation metric.
+calc_reg_metrics_conc <- function(list_of_dfs, group_label = "test") {
+  list_of_dfs %>%
+    purrr::map(~ {
+      ok  <- is.finite(.x$conc) & is.finite(.x$antilog_pred)
+      err <- .x$antilog_pred[ok] - .x$conc[ok]
+      data.frame(
+        metric   = c("rmse_ugL", "mae_ugL", "me_ugL"),
+        estimate = c(sqrt(mean(err^2)), mean(abs(err)), mean(err))
+      )
+    }) %>%
+    bind_rows(.id = "imputation") %>%
+    dplyr::group_by(metric) %>%
+    dplyr::summarise(pooled_estimate = mean(estimate), .groups = "drop") %>%
+    dplyr::mutate(group = group_label)
+}
+
 evaluate_and_predict <- function(metal.code){
   print(paste("Begin evaluation and prediction for", metal.code))
   MCL <- MCLs[metal.code]
@@ -120,19 +142,25 @@ evaluate_and_predict <- function(metal.code){
   # A. ORIGINAL test data
   # pool across 5 imputations
   test_reg <- calc_reg_metrics(test_predictions_uncens, group_label = "test")
+  test_reg_conc <- calc_reg_metrics_conc(test_predictions_uncens, group_label = "test")
   test_class <- calc_class_metrics(test_predictions, MCL, group_label = "test")
   # B. ADJUSTED test data 
   test_regAdj  <- calc_reg_metrics(test_predictions_adj_uncens, group_label = "test adj")
+  test_regAdj_conc <- calc_reg_metrics_conc(test_predictions_adj_uncens, group_label = "test adj")
   test_classAdj <- calc_class_metrics(test_predictions_adj, MCL, group_label = "test adj")
   # C. TRAIN data
   train_reg <- calc_reg_metrics(train_predictions_uncens, group_label = "train")
+  train_reg_conc <- calc_reg_metrics_conc(train_predictions_uncens, group_label = "train")
   train_class  <- calc_class_metrics(train_predictions, MCL, group_label ='train')
   # D. Compile all results into a table
-  df_metrics <- rbind(test_reg, test_class, test_regAdj, test_classAdj, train_reg, train_class) %>% 
+  df_metrics <- rbind(test_reg, test_class, test_regAdj, test_classAdj, train_reg, train_class,
+                      test_reg_conc, test_regAdj_conc, train_reg_conc) %>% 
     spread(group, pooled_estimate) %>% 
-    arrange(factor(metric, levels=c('sens','spec','accuracy','rsq','rmse','mae'))) %>%
+    arrange(factor(metric, levels=c('sens','spec','accuracy','rsq','rmse','mae',
+                                    'rmse_ugL','mae_ugL','me_ugL'))) %>%
     dplyr::mutate_if(is.numeric, round,3) %>% 
-    dplyr::mutate(metric = recode(metric,'sens'='sensitivity','spec'='specificity','rsq'='R2','rmse'='RMSE','mae'='MAE'))
+    dplyr::mutate(metric = recode(metric,'sens'='sensitivity','spec'='specificity','rsq'='R2','rmse'='RMSE','mae'='MAE',
+                                  'rmse_ugL'='RMSE (ug/L)','mae_ugL'='MAE (ug/L)','me_ugL'='ME (ug/L)'))
   # write out results 
   write_csv(df_metrics, paste0('R_Output/',metal.code,'_Model_Eval_Metrics.csv'))
   
@@ -140,11 +168,9 @@ evaluate_and_predict <- function(metal.code){
   make_pred_obs_plot <- function(df_list, title_suffix = "") {
     pooled <- bind_rows(df_list)
     r2 <- round(cor(pooled$logconc, pooled$.pred, use = "complete.obs")^2, 3)
-    ggplot(pooled, aes(x = logconc, y = .pred)) +
+    ggplot(pooled, aes(x = logconc, y = .pred, color = as.factor(is.imputed), shape = as.factor(is.imputed))) +
       geom_point(alpha = 0.35, size = 1.2) +
       geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
-      annotate("text", x = -Inf, y = Inf, hjust = -0.2, vjust = 1.5,
-               label = paste0("R² = ", r2), size = 3.5) +
       labs(
         x = "Observed (log₁₀ μg/L)",
         y = "Predicted (log₁₀ μg/L)",
@@ -154,8 +180,8 @@ evaluate_and_predict <- function(metal.code){
       theme(plot.title = element_text(hjust = 0.5))
   }
 
-  p_orig <- make_pred_obs_plot(test_predictions_uncens, " — Original")
-  p_adj  <- make_pred_obs_plot(test_predictions_adj_uncens, " — EDM Adjusted")
+  p_orig <- make_pred_obs_plot(test_predictions, " — Original")
+  p_adj  <- make_pred_obs_plot(test_predictions_adj, " — EDM Adjusted")
   patchwork::wrap_plots(p_orig, p_adj, ncol = 2)
   ggsave(paste0("R_Output/", metal.code, "_PredObs_scatter.png"), width = 10, height = 5)
 

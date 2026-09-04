@@ -306,3 +306,169 @@ imputed_data <- purrr::map_dfr(metal.codes, ~ readRDS(paste0("R_Output/", .x, "_
   )
 # save table 1
 write.csv(imputed_data, "R_Output/Table1_imputed_data_summary.csv", row.names = FALSE)
+
+
+##################################################################################
+#### Table S5. Reporting (censoring) limits for censored observations ############
+##################################################################################
+# Responds to Reviewer 1, comment 1a: "Are there multiple censoring limits for
+# each of the 5 trace elements? For each constituent, what were the censoring
+# limit(s) and number of samples for each limit?"
+#
+# The tables describe the analytic dataset that enters the MICE imputation above.
+# Two sources of the censoring limit are distinguished, because they are not the
+# same thing:
+#   (i)  "reported"    - the detection/quantitation limit reported with the
+#                        record in the Water Quality Portal (detect.limit,
+#                        carried through scripts 1-3);
+#   (ii) "kNN-filled"  - records with no reported limit, whose detect.limit is
+#                        filled in Step 3 of impute_missing_values() together
+#                        with the other numeric covariates (VIM::kNN, k = 5,
+#                        nearest neighbours in lon/lat). These are NOT reported
+#                        limits and are flagged separately below.
+# The limit actually used to bound the imputed concentration is the analytic
+# limit = reported where available, kNN-filled otherwise. One record = one well
+# (script 1 keeps the most recent sample per location.id).
+#
+# The analytic limits are read back from the saved imputation output
+# (R_Output/<metal>_imputed_data.rds), so the counts are exactly those used in
+# the imputation. If that file is absent the code falls back to reported limits
+# only and warns.
+
+# Assemble reported and analytic limits for one element ------------------------
+get_censoring_input <- function(metal.code) {
+  # same loading steps as impute_missing_values(), before any imputation
+  master <- readRDS(paste0("Data_Files/", metal.code, "_df_PredictorsSelected.rds")) %>%
+    dplyr::select(-c(censored.conc, ros.conc))
+  if (!"detect.limit" %in% colnames(master)) {
+    sup_master <- readRDS(paste0("R_Output/", metal.code, "_RawPredictors.rds")) %>%
+      st_drop_geometry() %>%
+      dplyr::select(location.id, detect.limit)
+    master <- master %>%
+      left_join(sup_master, by = "location.id")
+  }
+  master <- master %>%
+    dplyr::select(location.id, conc, censored, detect.limit) %>%
+    dplyr::rename(limit_reported = detect.limit)
+
+  imp_file <- paste0("R_Output/", metal.code, "_imputed_data.rds")
+  if (file.exists(imp_file)) {
+    # first completed dataset; detect.limit is identical across the 5 imputations
+    analytic_limits <- readRDS(imp_file) %>%
+      filter(.imp == 1) %>%
+      dplyr::select(location.id, limit_analytic = detect.limit)
+    master <- master %>% left_join(analytic_limits, by = "location.id")
+  } else {
+    warning(paste0(imp_file, " not found; Table S5 falls back to reported ",
+                   "limits and drops censored records without one."))
+    master <- master %>%
+      mutate(limit_analytic = limit_reported) %>%
+      filter(!(censored & is.na(limit_analytic)))
+  }
+
+  master %>%
+    mutate(
+      # guard against floating-point representations of the reported limits
+      limit_reported = signif(limit_reported, 6),
+      limit_analytic = signif(limit_analytic, 6),
+      limit_source   = ifelse(is.na(limit_reported), "kNN-filled", "reported")
+    )
+}
+
+# One row per element x censoring limit ----------------------------------------
+censoring_limit_table <- function(metal.code) {
+  master <- get_censoring_input(metal.code)
+  n_total <- nrow(master)
+  cens    <- master %>% filter(censored)
+
+  cens %>%
+    group_by(limit_analytic) %>%
+    summarise(
+      n_censored     = n(),
+      n_limit_reported   = sum(limit_source == "reported"),
+      n_limit_knn_filled = sum(limit_source == "kNN-filled"),
+      .groups = "drop"
+    ) %>%
+    arrange(limit_analytic) %>%
+    mutate(
+      element              = metal.code,
+      analyte              = metals[metal.code],
+      pct_of_censored      = 100 * n_censored / nrow(cens),
+      pct_of_all_samples   = 100 * n_censored / n_total,
+      n_samples_analytic   = n_total,
+      n_censored_total     = nrow(cens),
+      n_distinct_limits    = dplyr::n_distinct(limit_analytic)
+    ) %>%
+    dplyr::select(
+      element, analyte,
+      censoring_limit_ugL = limit_analytic,
+      n_censored, n_limit_reported, n_limit_knn_filled,
+      pct_of_censored, pct_of_all_samples,
+      n_samples_analytic, n_censored_total, n_distinct_limits
+    )
+}
+
+# (a) Element-level summary: one row per element --------------------------------
+tableS5_summary <- purrr::map_dfr(metal.codes, function(metal.code) {
+  master <- get_censoring_input(metal.code)
+  cens   <- master %>% filter(censored)
+  dl     <- cens$limit_analytic
+  tab    <- sort(table(dl), decreasing = TRUE)
+  tibble(
+    element                 = metal.code,
+    analyte                 = metals[metal.code],
+    MCL_or_HBSL_ugL         = MCLs[metal.code],
+    n_samples_analytic      = nrow(master),
+    n_censored              = nrow(cens),
+    pct_censored            = round(100 * nrow(cens) / nrow(master), 1),
+    n_distinct_limits       = length(unique(dl)),
+    limit_min_ugL           = min(dl),
+    limit_median_ugL        = median(dl),
+    limit_max_ugL           = max(dl),
+    most_common_limit_ugL   = as.numeric(names(tab)[1]),
+    pct_at_most_common      = round(100 * as.numeric(tab[1]) / length(dl), 1),
+    n_limits_covering_90pct = which(cumsum(as.numeric(tab)) / length(dl) >= 0.90)[1],
+    n_censored_limit_knn_filled = sum(cens$limit_source == "kNN-filled")
+  )
+})
+
+# (b) Full table: every distinct censoring limit, for every element -------------
+tableS5_full <- purrr::map_dfr(metal.codes, censoring_limit_table) %>%
+  mutate(across(c(pct_of_censored, pct_of_all_samples), ~ round(.x, 2)))
+
+# (c) Condensed table for the SI: limits carrying at least `pool_threshold`
+#     percent of an element's censored records are listed individually; the
+#     remaining (rare) limits are pooled into a single "Other" row.
+pool_threshold <- 1  # percent of censored records
+tableS5_condensed <- tableS5_full %>%
+  group_by(element, analyte) %>%
+  arrange(desc(n_censored), censoring_limit_ugL, .by_group = TRUE) %>%
+  group_modify(function(d, key) {
+    keep  <- d %>% filter(pct_of_censored >= pool_threshold) %>%
+      mutate(censoring_limit_ugL = as.character(censoring_limit_ugL))
+    other <- d %>% filter(pct_of_censored <  pool_threshold)
+    if (nrow(other) > 0) {
+      keep <- bind_rows(keep, tibble(
+        censoring_limit_ugL = sprintf(
+          "Other (%d limits, %s-%s)", nrow(other),
+          format(min(other$censoring_limit_ugL), scientific = FALSE),
+          format(max(other$censoring_limit_ugL), scientific = FALSE)
+        ),
+        n_censored         = sum(other$n_censored),
+        n_limit_reported   = sum(other$n_limit_reported),
+        n_limit_knn_filled = sum(other$n_limit_knn_filled),
+        pct_of_censored    = sum(other$pct_of_censored),
+        pct_of_all_samples = sum(other$pct_of_all_samples),
+        n_samples_analytic = d$n_samples_analytic[1],
+        n_censored_total   = d$n_censored_total[1],
+        n_distinct_limits  = d$n_distinct_limits[1]
+      ))
+    }
+    keep %>% mutate(cum_pct_of_censored = round(cumsum(pct_of_censored), 1))
+  }) %>%
+  ungroup() %>%
+  mutate(across(c(pct_of_censored, pct_of_all_samples), ~ round(.x, 1)))
+
+write.csv(tableS5_summary,   "R_Output/TableS5a_censoring_limits_summary.csv", row.names = FALSE)
+write.csv(tableS5_condensed, "R_Output/TableS5b_censoring_limits_condensed.csv", row.names = FALSE)
+write.csv(tableS5_full,      "R_Output/TableS5c_censoring_limits_full.csv", row.names = FALSE)
