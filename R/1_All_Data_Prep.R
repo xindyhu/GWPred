@@ -180,6 +180,8 @@ data_prep_function <- function(metal.code) {
       date,
       conc,
       well.depth,
+      location.type,
+      sample.fraction,
       data.source,
       DL.missing,
       detect.limit

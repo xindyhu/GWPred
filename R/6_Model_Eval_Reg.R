@@ -21,6 +21,17 @@ names(metals) <- metal.codes
 MCLs <- c(10, 5, 60, 300, 4000)
 names(MCLs) <- metal.codes
 
+#### read in auxilary geospatial data for regional shapley value 
+mapUSm <- read_sf(dsn="CoVar/US48", layer="US_48states") # load projected map of the US (in m)
+US.df <- fortify(mapUSm)
+aquifershp <- read_sf(dsn="CoVar/aquifrp025_nt00003", layer="aquifrp025") %>% st_set_crs(4269)  
+# CRS info comes from meta data https://catalog.data.gov/dataset/aquifers1
+# https://catalog.data.gov/harvest/object/a92b0a2a-2a5e-4709-879d-e78666d4c471
+pennsylvanian_aquifers <- aquifershp %>% filter(AQ_NAME == "Pennsylvanian aquifers") %>%
+  dplyr::select(geometry) 
+mississippi_river_valley_aquifers <- aquifershp %>% filter(str_detect(AQ_NAME, "Mississippi River Valley"))%>%
+  dplyr::select(geometry) 
+
 #### Back-transformed (real concentration unit) regression metrics ####
 # Predictions are back-transformed as 10^.pred (i.e. `antilog_pred`, the same quantity mapped in
 # 9_Map_Predict.R) and compared with observed concentrations in ug/L. Note that .pred estimates
@@ -105,7 +116,22 @@ evaluate_and_predict <- function(metal.code){
   }
   # Subset uncensored test data
   test_predictions_uncens <- map(test_predictions, ~ filter(.x, is.imputed == 0))
+
+  # Subset test data to points within the Mississippi River Valley aquifers (MRVA)
+  # Same spatial-join approach as the regional Shapley analysis (7_Shapley_Analysis.R):
+  # point-in-polygon inner join, so only wells falling inside the aquifer polygon are kept.
+  # Used later to compute model performance metrics for this subset only.
+  filter_to_mrva <- function(df) {
+    df %>%
+      st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE) %>%
+      st_transform(st_crs(mississippi_river_valley_aquifers)) %>%
+      st_join(mississippi_river_valley_aquifers, join = st_within, left = FALSE) %>% # inner join
+      st_drop_geometry()
+  }
+  test_predictions_mrva        <- map(test_predictions, filter_to_mrva)
+  test_predictions_uncens_mrva <- map(test_predictions_mrva, ~ filter(.x, is.imputed == 0))
   
+  #### Step 1. Make model predictions -----------------------------------------------------------------------------------------------
   #  Create predictions for train data
   train_predictions <- pmap(
     list(final_model, df_train),
@@ -119,6 +145,10 @@ evaluate_and_predict <- function(metal.code){
   
   # Subset uncensored train data
   train_predictions_uncens <- map(train_predictions, ~ filter(.x, is.imputed == 0))
+
+  # Subset train data to points within the Mississippi River Valley aquifers (MRVA)
+  train_predictions_mrva        <- map(train_predictions, filter_to_mrva)
+  train_predictions_uncens_mrva <- map(train_predictions_mrva, ~ filter(.x, is.imputed == 0))
   
   #### Step 2. Evaluate original and adjusted model results -----------------------------------------------------------------------------
   
@@ -142,17 +172,23 @@ evaluate_and_predict <- function(metal.code){
   # A. ORIGINAL test data
   # pool across 5 imputations
   test_reg <- calc_reg_metrics(test_predictions_uncens, group_label = "test")
+  test_reg_all <- calc_reg_metrics(test_predictions, group_label = "test")
   test_reg_conc <- calc_reg_metrics_conc(test_predictions_uncens, group_label = "test")
+  test_reg_conc_all <- calc_reg_metrics_conc(test_predictions, group_label = "test")
   test_class <- calc_class_metrics(test_predictions, MCL, group_label = "test")
   # B. ADJUSTED test data 
   test_regAdj  <- calc_reg_metrics(test_predictions_adj_uncens, group_label = "test adj")
+  test_regAdj_all  <- calc_reg_metrics(test_predictions_adj, group_label = "test adj")
   test_regAdj_conc <- calc_reg_metrics_conc(test_predictions_adj_uncens, group_label = "test adj")
+  test_regAdj_conc_all <- calc_reg_metrics_conc(test_predictions_adj, group_label = "test adj")
   test_classAdj <- calc_class_metrics(test_predictions_adj, MCL, group_label = "test adj")
   # C. TRAIN data
   train_reg <- calc_reg_metrics(train_predictions_uncens, group_label = "train")
+  train_reg_all <- calc_reg_metrics(train_predictions, group_label = "train")
   train_reg_conc <- calc_reg_metrics_conc(train_predictions_uncens, group_label = "train")
+  train_reg_conc_all <- calc_reg_metrics_conc(train_predictions, group_label = "train")
   train_class  <- calc_class_metrics(train_predictions, MCL, group_label ='train')
-  # D. Compile all results into a table
+  # D. Compile all results into a table (uncensored only)
   df_metrics <- rbind(test_reg, test_class, test_regAdj, test_classAdj, train_reg, train_class,
                       test_reg_conc, test_regAdj_conc, train_reg_conc) %>% 
     spread(group, pooled_estimate) %>% 
@@ -163,6 +199,50 @@ evaluate_and_predict <- function(metal.code){
                                   'rmse_ugL'='RMSE (ug/L)','mae_ugL'='MAE (ug/L)','me_ugL'='ME (ug/L)'))
   # write out results 
   write_csv(df_metrics, paste0('R_Output/',metal.code,'_Model_Eval_Metrics.csv'))
+  # D. Compile all results into a table
+  df_metrics_all <- rbind(test_reg_all, test_class, test_regAdj_all, test_classAdj, train_reg_all, train_class,
+                      test_reg_conc_all, test_regAdj_conc_all, train_reg_conc_all) %>% 
+    spread(group, pooled_estimate) %>% 
+    arrange(factor(metric, levels=c('sens','spec','accuracy','rsq','rmse','mae',
+                                    'rmse_ugL','mae_ugL','me_ugL'))) %>%
+    dplyr::mutate_if(is.numeric, round,3) %>% 
+    dplyr::mutate(metric = recode(metric,'sens'='sensitivity','spec'='specificity','rsq'='R2','rmse'='RMSE','mae'='MAE',
+                                  'rmse_ugL'='RMSE (ug/L)','mae_ugL'='MAE (ug/L)','me_ugL'='ME (ug/L)'))
+  # write out results 
+  write_csv(df_metrics_all, paste0('R_Output/',metal.code,'_Model_Eval_Metrics_BothCensoredAndUncensored.csv'))
+
+  #### Step 2b. Same metrics table, restricted to the MRVA aquifer subset -----------------------------------------------------------
+  # The national model and its (national) EDM calibration are held fixed; here we simply evaluate
+  # performance on the subset of wells that fall inside the Mississippi River Valley aquifers.
+  # Adjusted predictions are subset by row from the already-EDM-transformed frames (calibration is
+  # NOT re-fit on MRVA-only data), so this reports the deployed model's regional performance.
+  test_predictions_adj_mrva <- map(test_predictions_adj, filter_to_mrva)
+
+  # A. ORIGINAL test data (MRVA)
+  test_reg_all_mrva      <- calc_reg_metrics(test_predictions_mrva, group_label = "test")
+  test_reg_conc_all_mrva <- calc_reg_metrics_conc(test_predictions_mrva, group_label = "test")
+  test_class_mrva        <- calc_class_metrics(test_predictions_mrva, MCL, group_label = "test")
+  # B. ADJUSTED test data (MRVA)
+  test_regAdj_all_mrva      <- calc_reg_metrics(test_predictions_adj_mrva, group_label = "test adj")
+  test_regAdj_conc_all_mrva <- calc_reg_metrics_conc(test_predictions_adj_mrva, group_label = "test adj")
+  test_classAdj_mrva        <- calc_class_metrics(test_predictions_adj_mrva, MCL, group_label = "test adj")
+  # C. TRAIN data (MRVA)
+  train_reg_all_mrva      <- calc_reg_metrics(train_predictions_mrva, group_label = "train")
+  train_reg_conc_all_mrva <- calc_reg_metrics_conc(train_predictions_mrva, group_label = "train")
+  train_class_mrva        <- calc_class_metrics(train_predictions_mrva, MCL, group_label = "train")
+
+  # Compile MRVA-subset results into a table (same structure as df_metrics_all)
+  df_metrics_all_mrva <- rbind(test_reg_all_mrva, test_class_mrva, test_regAdj_all_mrva, test_classAdj_mrva,
+                               train_reg_all_mrva, train_class_mrva,
+                               test_reg_conc_all_mrva, test_regAdj_conc_all_mrva, train_reg_conc_all_mrva) %>%
+    spread(group, pooled_estimate) %>%
+    arrange(factor(metric, levels=c('sens','spec','accuracy','rsq','rmse','mae',
+                                    'rmse_ugL','mae_ugL','me_ugL'))) %>%
+    dplyr::mutate_if(is.numeric, round,3) %>%
+    dplyr::mutate(metric = recode(metric,'sens'='sensitivity','spec'='specificity','rsq'='R2','rmse'='RMSE','mae'='MAE',
+                                  'rmse_ugL'='RMSE (ug/L)','mae_ugL'='MAE (ug/L)','me_ugL'='ME (ug/L)'))
+  # write out results
+  write_csv(df_metrics_all_mrva, paste0('R_Output/',metal.code,'_Model_Eval_Metrics_MRVA.csv'))
   
   #### Step 3. Scatter plot: predicted vs. observed ---------------------------------------------------------------------------------------------
   make_pred_obs_plot <- function(df_list, title_suffix = "") {
@@ -177,7 +257,8 @@ evaluate_and_predict <- function(metal.code){
         title = paste0(metals[metal.code], title_suffix)
       ) +
       theme_bw() +
-      theme(plot.title = element_text(hjust = 0.5))
+      theme(plot.title = element_text(hjust = 0.5),
+            legend.position = "bottom")
   }
 
   p_orig <- make_pred_obs_plot(test_predictions, " — Original")

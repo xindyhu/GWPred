@@ -285,7 +285,9 @@ tabS9b <- cmp %>%
   group_by(element) %>%
   summarise(
     n                 = n(),
-    median_well_ft    = median(well.depth),
+    p25_ft     = quantile(well.depth, 0.25, na.rm = TRUE, names = FALSE),
+    median_ft  = median(well.depth, na.rm = TRUE),
+    p75_ft     = quantile(well.depth, 0.75, na.rm = TRUE, names = FALSE),
     median_usgs_top   = median(usgs_top_ft),
     median_usgs_bot   = median(usgs_bot_ft),
     pct_within        = 100 * mean(well.depth >= usgs_top_ft & well.depth <= usgs_bot_ft),
